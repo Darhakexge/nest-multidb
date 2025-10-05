@@ -1,0 +1,29 @@
+services:
+  mysql:
+    image: mysql:8.0 # You can specify a different MySQL version
+    container_name: my-mysql-container # Optional: give your container a specific name
+    environment:
+      MYSQL_ROOT_PASSWORD: secret # Replace with a strong password
+      MYSQL_DATABASE: app_db # Optional: create a default database
+      MYSQL_USER: usuario # Optional: create a default user
+      MYSQL_PASSWORD: secret # Optional: password for the default user
+    ports:
+      - "3306:3306" # Maps host port 3306 to container port 3306
+    volumes:
+      - mysql_data:/var/lib/mysql # Persist data using a named volume
+    restart: always # Ensure the container restarts automatically
+  db:
+    image: postgres:15-alpine # Specifies the PostgreSQL image and version
+    restart: always # Ensures the container restarts automatically if it stops
+    environment:
+      POSTGRES_USER: postgres # Defines the database username
+      POSTGRES_PASSWORD: pgsecret # Defines the password for the user
+      POSTGRES_DB: analytics_db # Defines the database name
+    ports:
+      - "5432:5432" # Maps host port 5432 to container port 5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data # Persists database data in a named volume
+
+volumes:
+  mysql_data: # Define the named volume
+  pgdata: # Defines the named volume for data persistence
