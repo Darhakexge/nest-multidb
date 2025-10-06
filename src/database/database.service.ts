@@ -1,161 +1,161 @@
-import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
-import { DataSource, DataSourceOptions, ObjectLiteral } from 'typeorm';
-import { EnvDbConfig } from './database.types';
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { DataSource, ObjectLiteral, QueryRunner, Repository } from 'typeorm';
+import type { DatabaseConfigMap } from './interfaces/database-config.interface';
+import { DatabaseConnectionConfig } from './interfaces/database-config.interface';
 
 @Injectable()
-export class DatabaseService implements OnModuleDestroy {
-  private readonly logger = new Logger(DatabaseService.name);
-  private readonly dataSources = new Map<string, DataSource>();
+export class DatabaseService {
+    private readonly logger = new Logger(DatabaseService.name);
+    private connections: Map<string, DataSource> = new Map();
+    private timeouts: Map<string, NodeJS.Timeout> = new Map();
 
-  /**
-   * Inicializa las conexiones a partir de configuraciones ya parseadas y validadas.
-   * Este método se invoca desde el módulo en el momento de arranque.
-   */
-  public async init(confs: EnvDbConfig[]) {
-    // Init each data source with retries
-    await Promise.all(
-      confs.map((cfg) =>
-        this.initializeDataSource(cfg).catch((err) => {
-          this.logger.error(
-            `Failed to initialize dataSource ${cfg.id}: ${err?.message ?? err}`,
-          );
-          throw err;
-        }),
-      ),
-    );
-  }
+    constructor(
+        @Inject('DATABASE_CONFIG')
+        private readonly config: DatabaseConfigMap,
+    ) {}
 
-  private buildDataSourceOptions(cfg: EnvDbConfig): DataSourceOptions {
-    const common = {
-      type: cfg.type,
-      host: cfg.host,
-      port: cfg.port,
-      username: cfg.username,
-      password: cfg.password,
-      database: cfg.database,
-    } as DataSourceOptions;
+    /**
+     * Obtiene o inicializa (lazy) una conexión
+     */
+    async connection(name: string): Promise<DataSource> {
+        if (this.connections.has(name)) return this.connections.get(name)!;
 
-    // We don't register entities by default to allow raw queries and on-demand repositories.
-    // But we can add common options.
-    const base: DataSourceOptions = {
-      ...common,
-      // disable logging by default; adjust as needed
-      logging: false,
-      // synchronize disabled by default in production. The user should set separately if needed.
-      synchronize: false,
-      // no entities by default; repos can be requested dynamically
-      entities: [],
-    };
+        const dbConfig = this.config[name];
+        if (!dbConfig)
+            throw new Error(
+                `No se encontró configuración para la conexión "${name}"`,
+            );
 
-    // Drivers-specific options could be added if required
-    return base;
-  }
+        const dataSource = await this.createDataSource(dbConfig);
+        this.connections.set(name, dataSource);
+        this.logger.log(`Conexión [${name}] inicializada`);
 
-  private async initializeDataSource(cfg: EnvDbConfig): Promise<void> {
-    const name = cfg.id;
-    if (this.dataSources.has(name)) {
-      this.logger.log(`DataSource ${name} already initialized, skipping.`);
-      return;
+        return dataSource;
     }
 
-    const options = this.buildDataSourceOptions(cfg);
-    // Create DataSource and attempt to initialize
-    const ds = new DataSource(options);
+    /**
+     * Crea una instancia DataSource con reintentos
+     */
+    private async createDataSource(
+        config: DatabaseConnectionConfig,
+    ): Promise<DataSource> {
+        const dataSource = new DataSource({
+            type: config.driver,
+            host: config.host,
+            port: config.port,
+            username: config.username,
+            password: config.password,
+            database: config.database,
+            charset: config.charset,
+            extra: { charset: config.charset, collation: config.collation },
+            synchronize: false,
+            entities: [],
+        });
 
-    const attempts = cfg.retryAttempts ?? 3;
-    const delayMs = cfg.retryDelayMs ?? 1000;
+        const maxAttempts = config.retryAttempts ?? 3;
+        const delay = config.retryDelay ?? 3000;
 
-    let lastError: unknown = null;
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      try {
-        this.logger.log(
-          `Initializing DataSource ${name}: attempt ${attempt}/${attempts}`,
-        );
-        await ds.initialize();
-        this.dataSources.set(name, ds);
-        this.logger.log(`DataSource ${name} initialized successfully.`);
-        return;
-      } catch (err) {
-        lastError = err;
-        this.logger.warn(
-          `DataSource ${name} init attempt ${attempt} failed: ${err?.message ?? err}`,
-        );
-        if (attempt < attempts) {
-          await this.sleep(delayMs);
+        for (let i = 0; i < maxAttempts; i++) {
+            try {
+                await dataSource.initialize();
+                this.scheduleAutoClose(config, dataSource);
+                return dataSource;
+            } catch (err) {
+                this.logger.warn(
+                    `Error al conectar con DB (${config.database}): intento ${i + 1}/${maxAttempts}`,
+                );
+                if (i === maxAttempts - 1) throw err;
+                await new Promise((res) => setTimeout(res, delay));
+            }
         }
-      }
-    }
-
-    // Si llegamos aquí, todos los reintentos fallaron
-    throw new Error(
-      `Unable to initialize DataSource ${name} after ${attempts} attempts. Last error: ${String(lastError)}`,
-    );
-  }
-
-  private sleep(ms: number) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  /**
-   * Obtiene una DataSource por su id.
-   * Lanza error si no existe o no está inicializada.
-   */
-  public getDataSource(id: string): DataSource {
-    const ds = this.dataSources.get(id);
-    if (!ds) {
-      throw new Error(
-        `DataSource with id "${id}" not found or not initialized.`,
-      );
-    }
-    if (!ds.isInitialized) {
-      throw new Error(`DataSource "${id}" is not initialized.`);
-    }
-    return ds;
-  }
-
-  /**
-   * Ejecuta una consulta preparada (raw SQL) en la base de datos indicada.
-   * @param databaseId identificador DB (ej. APP1, ANALYTICS)
-   * @param sql consulta SQL con placeholders
-   * @param params bindings array
-   */
-  public async query(
-    databaseId: string,
-    sql: string,
-    params?: any[],
-  ): Promise<any> {
-    const ds = this.getDataSource(databaseId);
-    return ds.query(sql, params ?? []);
-  }
-
-  /**
-   * Obtiene un repository de TypeORM para una entidad dada y conexión.
-   * @param databaseId identificador DB
-   * @param entity clase de entidad o nombre
-   */
-  public getRepository<Entity extends ObjectLiteral>(
-    databaseId: string,
-    entity: any,
-  ) {
-    const ds = this.getDataSource(databaseId);
-    return ds.getRepository<Entity>(entity);
-  }
-
-  /**
-   * Cierra todas las conexiones al destruir el módulo.
-   */
-  public async onModuleDestroy() {
-    for (const [id, ds] of this.dataSources.entries()) {
-      try {
-        if (ds && ds.isInitialized) {
-          await ds.destroy();
-          this.logger.log(`DataSource ${id} destroyed.`);
-        }
-      } catch (err) {
-        this.logger.warn(
-          `Error destroying DataSource ${id}: ${err?.message ?? err}`,
+        throw new Error(
+            `No se pudo conectar con la base de datos ${config.database}`,
         );
-      }
     }
-  }
+
+    /**
+     * Ejecuta una consulta directa
+     */
+    async query(name: string, sql: string, params?: any[]): Promise<any> {
+        const conn = await this.connection(name);
+        this.scheduleAutoClose(this.config[name], conn);
+        return conn.query(sql, params);
+    }
+
+    /**
+     * Obtiene repositorio de una entidad
+     */
+    async getRepository<T extends ObjectLiteral>(
+        name: string,
+        entity: new () => T,
+    ): Promise<Repository<T>> {
+        const conn = await this.connection(name);
+        this.scheduleAutoClose(this.config[name], conn);
+        return conn.getRepository(entity);
+    }
+
+    /**
+     * Ejecuta transacción
+     */
+    async transaction<T>(
+        name: string,
+        fn: (trx: QueryRunner) => Promise<T>,
+    ): Promise<T> {
+        const conn = await this.connection(name);
+        const runner = conn.createQueryRunner();
+        await runner.connect();
+        await runner.startTransaction();
+        try {
+            const result = await fn(runner);
+            await runner.commitTransaction();
+            return result;
+        } catch (err) {
+            await runner.rollbackTransaction();
+            throw err;
+        } finally {
+            await runner.release();
+        }
+    }
+
+    /**
+     * Cierra conexiones inactivas automáticamente
+     */
+    private scheduleAutoClose(
+        config: DatabaseConnectionConfig,
+        dataSource: DataSource,
+    ) {
+        const timeoutMs = 5 * 60 * 1000; // 5 minutos
+        const dbName = config.database!;
+        if (this.timeouts.has(dbName)) clearTimeout(this.timeouts.get(dbName));
+        this.timeouts.set(
+            dbName,
+            setTimeout(async () => {
+                if (dataSource.isInitialized) {
+                    await dataSource.destroy();
+                    this.connections.delete(dbName);
+                    this.logger.log(
+                        `Conexión cerrada por inactividad: ${dbName}`,
+                    );
+                }
+            }, timeoutMs),
+        );
+    }
+
+    async onApplicationShutdown(signal?: string) {
+        this.logger.warn(
+            `Cerrando conexiones (${signal ?? 'manual shutdown'})...`,
+        );
+        for (const [name, conn] of this.connections) {
+            if (conn.isInitialized) {
+                await conn
+                    .destroy()
+                    .catch((err) =>
+                        this.logger.error(
+                            `Error cerrando conexión ${name}: ${err.message}`,
+                        ),
+                    );
+            }
+        }
+        this.logger.log('Todas las conexiones cerradas.');
+    }
 }

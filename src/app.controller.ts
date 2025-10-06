@@ -3,10 +3,10 @@ import { AppService } from './app.service';
 
 @Controller()
 export class AppController {
-  constructor(private readonly appService: AppService) {}
+    constructor(private readonly appService: AppService) {}
 
-  @Get()
-  async getHello() {
-    return await this.appService.findUserByIdRaw('ANALYTICS', 1);
-  }
+    @Get()
+    async getHello() {
+        return await this.appService.findUserRaw('app1', 1);
+    }
 }
