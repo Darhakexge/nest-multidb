@@ -1,0 +1,13 @@
+{
+    "type": "object",
+    "properties": {
+        "nombre": {
+            "type": "string"
+        },
+        "edad": {
+            "type": "number"
+        }
+    },
+    "required": ["nombre", "edad"],
+    "additionalProperties": false
+}
